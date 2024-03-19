@@ -7,7 +7,6 @@ use crate::{
     Metrics,
 };
 use alloc::vec::*;
-use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
 
 /// Horizontal alignment options for text when a max_width is provided.
@@ -19,6 +18,8 @@ pub enum HorizontalAlign {
     Center,
     /// Aligns text to the right of the region defined by the max_width.
     Right,
+    /// Aligns text to the left of the region defined by the max_width and justifies it.
+    Justify,
 }
 
 /// Vertical alignment options for text when a max_height is provided.
@@ -132,11 +133,11 @@ impl Eq for GlyphRasterConfig {}
 
 /// A positioned scaled glyph.
 #[derive(Debug, Copy, Clone)]
-pub struct GlyphPosition<U: Copy + Clone = ()> {
+pub struct GlyphPosition<'a, U: Copy + Clone = ()> {
     /// Hashable key that can be used to uniquely identify a rasterized glyph.
-    pub key: GlyphRasterConfig,
+    pub key: Option<GlyphRasterConfig>,
     /// The index of the font used to generate this glyph position.
-    pub font_index: usize,
+    pub font: &'a Font,
     /// The associated character that generated this glyph. A character may generate multiple
     /// glyphs.
     pub parent: char,
@@ -152,45 +153,87 @@ pub struct GlyphPosition<U: Copy + Clone = ()> {
     pub width: usize,
     /// The height of the glyph. Dimensions are in pixels.
     pub height: usize,
-    /// The byte offset into the original string used in the append call which created
-    /// this glyph.
-    pub byte_offset: usize,
     /// Additional metadata associated with the character used to generate this glyph.
     pub char_data: CharacterData,
     /// Custom user data associated with the text styled used to generate this glyph.
     pub user_data: U,
 }
 
-/// A style description for a segment of text.
-pub struct TextStyle<'a, U: Copy + Clone = ()> {
-    /// The text to layout.
-    pub text: &'a str,
+/// Vertical alignment options for a block span.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum BlockAlign {
+    /// Aligns block relative to the baseline.
+    Baseline,
+    /// Aligns block relative to the middle of font ascent - descent.
+    Middle,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct BlockParams {
+    /// The width of the block. Dimensions are in pixels.
+    pub width: usize,
+    /// The height of the block. Dimensions are in pixels.
+    pub height: usize,
+    /// The vertical alignment option.
+    pub align: BlockAlign,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum SpanParams<'a> {
+    Text(&'a str),
+    Block(BlockParams),
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct Span<'a, U: Copy + Clone = ()> {
     /// The scale of the text in pixel units. The units of the scale are pixels per Em unit.
     pub px: f32,
     /// The font to layout the text in.
-    pub font_index: usize,
-    /// Additional user data to associate with glyphs produced by this text style.
+    pub font: &'a Font,
+    /// Additional user data to associate with glyphs produced by this span.
     pub user_data: U,
+    /// Style settings.
+    pub params: SpanParams<'a>,
 }
 
-impl<'a> TextStyle<'a> {
-    pub fn new(text: &'a str, px: f32, font_index: usize) -> TextStyle<'a> {
-        TextStyle {
-            text,
+impl<'a> Span<'a> {
+    pub fn text(text: &'a str, px: f32, font: &'a Font) -> Self {
+        Span {
             px,
-            font_index,
+            font,
             user_data: (),
+            params: SpanParams::Text(text),
         }
     }
 }
 
-impl<'a, U: Copy + Clone> TextStyle<'a, U> {
-    pub fn with_user_data(text: &'a str, px: f32, font_index: usize, user_data: U) -> TextStyle<'a, U> {
-        TextStyle {
-            text,
+impl<'a, U: Copy + Clone> Span<'a, U> {
+    pub fn text_with_user_data(text: &'a str, px: f32, font: &'a Font, user_data: U) -> Self {
+        Span {
             px,
-            font_index,
+            font,
             user_data,
+            params: SpanParams::Text(text),
+        }
+    }
+
+    pub fn block(
+        width: usize,
+        height: usize,
+        align: BlockAlign,
+        px: f32,
+        font: &'a Font,
+        user_data: U,
+    ) -> Self {
+        Span {
+            px,
+            font,
+            user_data,
+            params: SpanParams::Block(BlockParams {
+                width,
+                height,
+                align,
+            }),
         }
     }
 }
@@ -243,7 +286,7 @@ impl Default for LinePosition {
 /// Text layout requires a small amount of heap usage which is contained in the Layout struct. This
 /// context is reused between layout calls. Reusing the Layout struct will greatly reduce memory
 /// allocations and is advisable for performance.
-pub struct Layout<U: Copy + Clone = ()> {
+pub struct Layout<'a, U: Copy + Clone = ()> {
     /// Marks if layout should be performed as if the Y axis is flipped (Positive Y incrementing
     /// down instead of up).
     flip: bool,
@@ -267,9 +310,9 @@ pub struct Layout<U: Copy + Clone = ()> {
     height: f32,
 
     /// Finalized glyph state.
-    output: Vec<GlyphPosition<U>>,
+    output: Vec<GlyphPosition<'a, U>>,
     /// Intermediate glyph state.
-    glyphs: Vec<GlyphPosition<U>>,
+    glyphs: Vec<GlyphPosition<'a, U>>,
 
     /// Linebreak state. Used to derive linebreaks from past glyphs.
     linebreaker: Linebreaker,
@@ -281,6 +324,12 @@ pub struct Layout<U: Copy + Clone = ()> {
     /// The index of the glyph that has the current highest priority linebreak status. This glyph is
     /// the last glyph on a line if a linebreak is required.
     linebreak_idx: usize,
+    /// If the previous glyph was not whitespace.
+    prev_not_whitespace: bool,
+    /// The x position that the last rasterizable glyph ends at.
+    line_end_pos: f32,
+    /// The index of the last rasterizable glyph.
+    line_end_idx: usize,
 
     /// Layout state of each line currently laid out. This always has at least 1 element.
     line_metrics: Vec<LinePosition>,
@@ -296,15 +345,19 @@ pub struct Layout<U: Copy + Clone = ()> {
     current_new_line: f32,
     /// The x position the current line starts at.
     start_pos: f32,
+    /// If the text is justified.
+    justify: bool,
+    /// If the text should wrap by letter.
+    wrap_by_letter: bool,
 
     /// The settings currently being used for layout.
     settings: LayoutSettings,
 }
 
-impl<'a, U: Copy + Clone> Layout<U> {
+impl<'a, U: Copy + Clone> Layout<'a, U> {
     /// Creates a layout instance. This requires the direction that the Y coordinate increases in.
     /// Layout needs to be aware of your coordinate system to place the glyphs correctly.
-    pub fn new(coordinate_system: CoordinateSystem) -> Layout<U> {
+    pub fn new(coordinate_system: CoordinateSystem) -> Layout<'a, U> {
         let settings = LayoutSettings::default();
 
         let mut layout = Layout {
@@ -324,6 +377,9 @@ impl<'a, U: Copy + Clone> Layout<U> {
             linebreak_prev: LINEBREAK_NONE,
             linebreak_pos: 0.0,
             linebreak_idx: 0,
+            prev_not_whitespace: false,
+            line_end_pos: 0.0,
+            line_end_idx: 0,
             current_pos: 0.0,
             current_ascent: 0.0,
             current_descent: 0.0,
@@ -331,6 +387,8 @@ impl<'a, U: Copy + Clone> Layout<U> {
             current_new_line: 0.0,
             start_pos: 0.0,
             height: 0.0,
+            justify: false,
+            wrap_by_letter: false,
             settings,
         };
         layout.reset(&settings);
@@ -362,12 +420,14 @@ impl<'a, U: Copy + Clone> Layout<U> {
             0.0
         } else {
             match settings.horizontal_align {
-                HorizontalAlign::Left => 0.0,
+                HorizontalAlign::Left | HorizontalAlign::Justify => 0.0,
                 HorizontalAlign::Center => 0.5,
                 HorizontalAlign::Right => 1.0,
             }
         };
         self.line_height = settings.line_height;
+        self.justify = settings.horizontal_align == HorizontalAlign::Justify;
+        self.wrap_by_letter = settings.wrap_style == WrapStyle::Letter;
         self.clear();
     }
 
@@ -382,6 +442,9 @@ impl<'a, U: Copy + Clone> Layout<U> {
         self.linebreak_prev = LINEBREAK_NONE;
         self.linebreak_pos = 0.0;
         self.linebreak_idx = 0;
+        self.prev_not_whitespace = false;
+        self.line_end_pos = 0.0;
+        self.line_end_idx = 0;
         self.current_pos = 0.0;
         self.current_ascent = 0.0;
         self.current_descent = 0.0;
@@ -417,44 +480,48 @@ impl<'a, U: Copy + Clone> Layout<U> {
     /// Characters from the input string can only be omitted from the output, they are never
     /// reordered. The output buffer will always contain characters in the order they were defined
     /// in the styles.
-    pub fn append<T: Borrow<Font>>(&mut self, fonts: &[T], style: &TextStyle<U>) {
+    ///
+    /// Custom inline blocks are also allowed, and are treated as single non whitespace glyphs
+    /// with the specified width and height, and it is up to the application to decide what
+    /// to do with this reserved space.
+    pub fn append(&mut self, span: &Span<'a, U>) {
+        match span.params {
+            SpanParams::Text(text) => self.append_text(span.px, span.font, span.user_data, text),
+            SpanParams::Block(p) => self.append_block(span.px, span.font, span.user_data, &p),
+        }
+    }
+
+    /// Performs layout for text horizontally, and wrapping vertically. This makes a best effort
+    /// attempt at laying out the text defined in the given styles with the provided layout
+    /// settings. Text may overflow out of the bounds defined in the layout settings and it's up
+    /// to the application to decide how to deal with this.
+    ///
+    /// Characters from the input string can only be omitted from the output, they are never
+    /// reordered. The output buffer will always contain characters in the order they were defined
+    /// in the styles.
+    fn append_text(&mut self, px: f32, font: &'a Font, user_data: U, text: &'a str) {
         // The first layout pass requires some text.
-        if style.text.is_empty() {
+        if text.is_empty() {
             return;
         }
 
-        let font: &Font = &fonts[style.font_index].borrow();
-
-        if let Some(metrics) = font.horizontal_line_metrics(style.px) {
+        if let Some(metrics) = font.horizontal_line_metrics(px) {
             self.current_ascent = ceil(metrics.ascent);
             self.current_new_line = ceil(metrics.new_line_size);
             self.current_descent = ceil(metrics.descent);
             self.current_line_gap = ceil(metrics.line_gap);
-            if let Some(line) = self.line_metrics.last_mut() {
-                if self.current_ascent > line.max_ascent {
-                    line.max_ascent = self.current_ascent;
-                }
-                if self.current_descent < line.min_descent {
-                    line.min_descent = self.current_descent;
-                }
-                if self.current_line_gap > line.max_line_gap {
-                    line.max_line_gap = self.current_line_gap;
-                }
-                if self.current_new_line > line.max_new_line_size {
-                    line.max_new_line_size = self.current_new_line;
-                }
-            }
+            self.update_last_line_metrics();
         }
 
         let mut byte_offset = 0;
-        while byte_offset < style.text.len() {
-            let prev_byte_offset = byte_offset;
-            let character = read_utf8(style.text.as_bytes(), &mut byte_offset);
+        while byte_offset < text.len() {
+            let character = read_utf8(text.as_bytes(), &mut byte_offset);
             let linebreak = self.linebreaker.next(character).mask(self.wrap_mask);
             let glyph_index = font.lookup_glyph_index(character);
             let char_data = CharacterData::classify(character, glyph_index);
+            let whitespace = char_data.is_whitespace();
             let metrics = if !char_data.is_control() {
-                font.metrics_indexed(glyph_index, style.px)
+                font.metrics_indexed(glyph_index, px)
             } else {
                 Metrics::default()
             };
@@ -466,28 +533,16 @@ impl<'a, U: Copy + Clone> Layout<U> {
                 self.linebreak_idx = self.glyphs.len().saturating_sub(1); // Mark the previous glyph
             }
 
+            if self.prev_not_whitespace && (self.wrap_by_letter || whitespace) {
+                self.line_end_pos = self.current_pos;
+                self.line_end_idx = self.glyphs.len().saturating_sub(!whitespace as usize);
+            }
+
             // Perform a linebreak
-            if linebreak.is_hard() || (self.current_pos - self.start_pos + advance > self.max_width) {
-                self.linebreak_prev = LINEBREAK_NONE;
-                let mut next_glyph_start = self.glyphs().len();
-                if let Some(line) = self.line_metrics.last_mut() {
-                    line.glyph_end = self.linebreak_idx;
-                    line.padding = self.max_width - (self.linebreak_pos - self.start_pos);
-                    self.height += line.max_new_line_size * self.line_height;
-                    next_glyph_start = self.linebreak_idx + 1;
-                }
-                self.line_metrics.push(LinePosition {
-                    baseline_y: 0.0,
-                    padding: 0.0,
-                    max_ascent: self.current_ascent,
-                    min_descent: self.current_descent,
-                    max_line_gap: self.current_line_gap,
-                    max_new_line_size: self.current_new_line,
-                    glyph_start: next_glyph_start,
-                    glyph_end: 0,
-                    tracking_x: self.linebreak_pos,
-                });
-                self.start_pos = self.linebreak_pos;
+            if linebreak.is_hard()
+                || (self.current_pos - self.start_pos + advance > self.max_width && !whitespace)
+            {
+                self.perform_linebreak(&linebreak);
             }
 
             let y = if self.flip {
@@ -497,22 +552,22 @@ impl<'a, U: Copy + Clone> Layout<U> {
             };
 
             self.glyphs.push(GlyphPosition {
-                key: GlyphRasterConfig {
+                key: Some(GlyphRasterConfig {
                     glyph_index: glyph_index as u16,
-                    px: style.px,
+                    px,
                     font_hash: font.file_hash(),
-                },
-                font_index: style.font_index,
+                }),
+                font,
                 parent: character,
-                byte_offset: prev_byte_offset,
                 x: floor(self.current_pos + metrics.bounds.xmin),
                 y,
                 width: metrics.width,
                 height: metrics.height,
                 char_data,
-                user_data: style.user_data,
+                user_data,
             });
             self.current_pos += advance;
+            self.prev_not_whitespace = !whitespace;
         }
 
         if let Some(line) = self.line_metrics.last_mut() {
@@ -521,6 +576,133 @@ impl<'a, U: Copy + Clone> Layout<U> {
         }
 
         self.finalize();
+    }
+
+    /// Performs layout for an inline block horizontally, and wrapping vertically. An inline
+    /// block is treated as a single empty glyph with the specified width and height, and
+    /// it is up to the application to decide what to do with this reserved space.
+    fn append_block(&mut self, px: f32, font: &'a Font, user_data: U, params: &BlockParams) {
+        if params.width == 0 || params.height == 0 {
+            return;
+        }
+
+        if let (Some(metrics), BlockAlign::Middle) = (font.horizontal_line_metrics(px), params.align) {
+            let font_height = metrics.ascent - metrics.descent;
+            let block_ascent = metrics.ascent / font_height * params.height as f32;
+            let block_descent = metrics.descent / font_height * params.height as f32;
+            self.current_ascent = ceil(block_ascent);
+            self.current_descent = ceil(block_descent);
+            self.current_new_line = ceil(block_ascent - block_descent + metrics.line_gap);
+            self.current_line_gap = ceil(metrics.line_gap);
+        } else {
+            self.current_ascent = params.height as f32;
+            self.current_descent = 0.0;
+            self.current_new_line = self.current_ascent;
+            self.current_line_gap = 0.0;
+        }
+        self.update_last_line_metrics();
+
+        let character = 'x';
+        let linebreak = self.linebreaker.next(character).mask(self.wrap_mask);
+        let char_data = CharacterData::classify(character, 0);
+        let advance = params.width as f32;
+
+        if linebreak >= self.linebreak_prev {
+            self.linebreak_prev = linebreak;
+            self.linebreak_pos = self.current_pos;
+            self.linebreak_idx = self.glyphs.len().saturating_sub(1); // Mark the previous glyph
+        }
+
+        if self.prev_not_whitespace && self.wrap_by_letter {
+            self.line_end_pos = self.current_pos;
+            self.line_end_idx = self.glyphs.len().saturating_sub(1);
+        }
+
+        if self.current_pos - self.start_pos + advance > self.max_width {
+            self.perform_linebreak(&linebreak);
+        }
+
+        let y = if self.flip {
+            -self.current_ascent
+        } else {
+            self.current_descent
+        };
+
+        self.glyphs.push(GlyphPosition {
+            key: None,
+            font,
+            parent: character,
+            x: floor(self.current_pos),
+            y,
+            width: params.width,
+            height: params.height,
+            char_data,
+            user_data,
+        });
+        self.current_pos += advance;
+        self.prev_not_whitespace = true;
+
+        if let Some(line) = self.line_metrics.last_mut() {
+            line.padding = self.max_width - (self.current_pos - self.start_pos);
+            line.glyph_end = self.glyphs.len().saturating_sub(1);
+        }
+
+        self.finalize();
+    }
+
+    fn update_last_line_metrics(&mut self) {
+        if let Some(line) = self.line_metrics.last_mut() {
+            if self.current_ascent > line.max_ascent {
+                line.max_ascent = self.current_ascent;
+            }
+            if self.current_descent < line.min_descent {
+                line.min_descent = self.current_descent;
+            }
+            if self.current_line_gap > line.max_line_gap {
+                line.max_line_gap = self.current_line_gap;
+            }
+            if self.current_new_line > line.max_new_line_size {
+                line.max_new_line_size = self.current_new_line;
+            }
+        }
+    }
+
+    fn perform_linebreak(&mut self, linebreak: &LinebreakData) {
+        self.linebreak_prev = LINEBREAK_NONE;
+        let mut next_glyph_start = self.glyphs().len();
+        if let Some(line) = self.line_metrics.last_mut() {
+            line.glyph_end = self.line_end_idx;
+            line.padding = self.max_width - (self.line_end_pos - self.start_pos);
+            self.height += line.max_new_line_size * self.line_height;
+            next_glyph_start = self.linebreak_idx + 1;
+            if self.justify && !linebreak.is_hard() {
+                let n_spaces = self.glyphs[line.glyph_start..line.glyph_end]
+                    .iter()
+                    .filter(|g| g.char_data.is_whitespace())
+                    .count();
+                let extra_space = line.padding / n_spaces as f32;
+                let mut dx = 0.0;
+                for glyph in &mut self.glyphs[line.glyph_start..line.glyph_end] {
+                    glyph.x = ceil(glyph.x + dx);
+                    if glyph.char_data.is_whitespace() {
+                        dx += extra_space;
+                    }
+                }
+                line.padding = 0.0;
+            }
+        }
+        self.line_metrics.push(LinePosition {
+            baseline_y: 0.0,
+            padding: 0.0,
+            max_ascent: self.current_ascent,
+            min_descent: self.current_descent,
+            max_line_gap: self.current_line_gap,
+            max_new_line_size: self.current_new_line,
+            glyph_start: next_glyph_start,
+            glyph_end: 0,
+            tracking_x: self.linebreak_pos,
+        });
+        self.start_pos = self.linebreak_pos;
     }
 
     fn finalize(&mut self) {
