@@ -77,8 +77,7 @@ pub struct LayoutSettings {
     pub horizontal_align: HorizontalAlign,
     /// The default is Top. This option does nothing if the max_height isn't set.
     pub vertical_align: VerticalAlign,
-    /// The height of each line as a multiplier of the default.
-    pub line_height: f32,
+
     /// The default is Word. Wrap style is a hint for how strings of text should be wrapped to the
     /// next line. Line wrapping can happen when the max width/height is reached.
     pub wrap_style: WrapStyle,
@@ -96,7 +95,6 @@ impl Default for LayoutSettings {
             max_height: None,
             horizontal_align: HorizontalAlign::Left,
             vertical_align: VerticalAlign::Top,
-            line_height: 1.0,
             wrap_style: WrapStyle::Word,
             wrap_hard_breaks: true,
         }
@@ -133,11 +131,11 @@ impl Eq for GlyphRasterConfig {}
 
 /// A positioned scaled glyph.
 #[derive(Debug, Copy, Clone)]
-pub struct GlyphPosition<'a, U: Copy + Clone = ()> {
+pub struct GlyphPosition<'f, U: Copy + Clone = ()> {
     /// Hashable key that can be used to uniquely identify a rasterized glyph.
     pub key: Option<GlyphRasterConfig>,
     /// The index of the font used to generate this glyph position.
-    pub font: &'a Font,
+    pub font: &'f Font,
     /// The associated character that generated this glyph. A character may generate multiple
     /// glyphs.
     pub parent: char,
@@ -168,74 +166,105 @@ pub enum BlockAlign {
     Middle,
 }
 
+macro_rules! att_set {
+    ($method:ident $att:ident $t:ty) => {
+        #[must_use]
+        pub fn $method(mut self, $att: $t) -> Self {
+            self.$att = $att;
+            self
+        }
+    };
+}
+
+macro_rules! att_opt_set {
+    ($method:ident $att:ident $t:ty) => {
+        #[must_use]
+        pub fn $method(mut self, $att: $t) -> Self {
+            self.$att = Some($att);
+            self
+        }
+    };
+}
+
+/// Parameters describing a reserved inline block space.
 #[derive(Debug, Copy, Clone)]
-pub struct BlockParams {
+pub struct Block {
     /// The width of the block. Dimensions are in pixels.
-    pub width: usize,
+    width: usize,
     /// The height of the block. Dimensions are in pixels.
-    pub height: usize,
+    height: usize,
     /// The vertical alignment option.
-    pub align: BlockAlign,
+    align: BlockAlign,
 }
 
-#[derive(Debug, Copy, Clone)]
-pub enum SpanParams<'a> {
-    Text(&'a str),
-    Block(BlockParams),
+impl Block {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            align: BlockAlign::Middle,
+        }
+    }
+
+    att_set!(with_align align BlockAlign);
 }
 
-#[derive(Debug, Copy, Clone)]
-pub struct Span<'a, U: Copy + Clone = ()> {
-    /// The scale of the text in pixel units. The units of the scale are pixels per Em unit.
-    pub px: f32,
+/// Parameters specific to text or block.
+#[derive(Debug, Clone)]
+enum SpanParams<'t> {
+    Text(&'t str),
+    Block(Block),
+}
+
+/// Parameters to define a text span or inline block in a text layout.
+#[derive(Debug, Clone)]
+pub struct Span<'f, 't, U: Copy + Clone = ()> {
     /// The font to layout the text in.
-    pub font: &'a Font,
+    font: Option<&'f Font>,
+    /// The scale of the text in pixel units. The units of the scale are pixels per Em unit.
+    px: Option<f32>,
+    /// Vertical offset in pixels.
+    rise: f32,
+    /// Horizontal offeset in pixels.
+    kerning: f32,
+    /// Line height multiplier.
+    line_height: Option<f32>,
+    /// Parameters specific to text or block.
+    params: SpanParams<'t>,
     /// Additional user data to associate with glyphs produced by this span.
-    pub user_data: U,
-    /// Style settings.
-    pub params: SpanParams<'a>,
+    user_data: U,
 }
 
-impl<'a> Span<'a> {
-    pub fn text(text: &'a str, px: f32, font: &'a Font) -> Self {
+impl<'f, 't, U: Copy + Clone> Span<'f, 't, U> {
+    pub fn text(text: &'t str, user_data: U) -> Self {
         Span {
-            px,
-            font,
-            user_data: (),
+            font: None,
+            px: None,
+            rise: 0.0,
+            kerning: 0.0,
+            line_height: None,
             params: SpanParams::Text(text),
-        }
-    }
-}
-
-impl<'a, U: Copy + Clone> Span<'a, U> {
-    pub fn text_with_user_data(text: &'a str, px: f32, font: &'a Font, user_data: U) -> Self {
-        Span {
-            px,
-            font,
             user_data,
-            params: SpanParams::Text(text),
         }
     }
 
-    pub fn block(
-        width: usize,
-        height: usize,
-        align: BlockAlign,
-        px: f32,
-        font: &'a Font,
-        user_data: U,
-    ) -> Self {
+    pub fn block(block: Block, user_data: U) -> Self {
         Span {
-            px,
-            font,
+            font: None,
+            px: None,
+            rise: 0.0,
+            kerning: 0.0,
+            line_height: None,
+            params: SpanParams::Block(block),
             user_data,
-            params: SpanParams::Block(BlockParams {
-                width,
-                height,
-                align,
-            }),
         }
     }
+
+    att_opt_set!(with_font font &'f Font);
+    att_opt_set!(with_px px f32);
+    att_set!(with_rise rise f32);
+    att_set!(with_kerning kerning f32);
+    att_opt_set!(with_line_height line_height f32);
 }
 
 /// Metrics about a positioned line.
@@ -259,6 +288,8 @@ pub struct LinePosition {
     /// A precalculated value for the of the line depending. It's calculated by: ascent - descent +
     /// line_gap. If there are multiple styles on this line, this is their max value.
     pub max_new_line_size: f32,
+    /// The highest multiplier for the amount of space between lines used in the line.
+    pub line_height: Option<f32>,
     /// The GlyphPosition index of the first glyph in the line.
     pub glyph_start: usize,
     /// The GlyphPosition index of the last glyph in the line.
@@ -276,6 +307,7 @@ impl Default for LinePosition {
             min_descent: 0.0,
             max_line_gap: 0.0,
             max_new_line_size: 0.0,
+            line_height: None,
             glyph_start: 0,
             glyph_end: 0,
             tracking_x: 0.0,
@@ -286,7 +318,7 @@ impl Default for LinePosition {
 /// Text layout requires a small amount of heap usage which is contained in the Layout struct. This
 /// context is reused between layout calls. Reusing the Layout struct will greatly reduce memory
 /// allocations and is advisable for performance.
-pub struct Layout<'a, U: Copy + Clone = ()> {
+pub struct Layout<'f, U: Copy + Clone = ()> {
     /// Marks if layout should be performed as if the Y axis is flipped (Positive Y incrementing
     /// down instead of up).
     flip: bool,
@@ -304,15 +336,17 @@ pub struct Layout<'a, U: Copy + Clone = ()> {
     vertical_align: f32,
     /// A multiplier for how text fills unused horizontal space.
     horizontal_align: f32,
-    /// A multiplier for the amount of space between lines.
-    line_height: f32,
     /// The current height of all laid out text.
     height: f32,
+    /// The default font for the text.
+    base_font: &'f Font,
+    /// The default size for the text.
+    base_px: f32,
 
     /// Finalized glyph state.
-    output: Vec<GlyphPosition<'a, U>>,
+    output: Vec<GlyphPosition<'f, U>>,
     /// Intermediate glyph state.
-    glyphs: Vec<GlyphPosition<'a, U>>,
+    glyphs: Vec<GlyphPosition<'f, U>>,
 
     /// Linebreak state. Used to derive linebreaks from past glyphs.
     linebreaker: Linebreaker,
@@ -343,6 +377,8 @@ pub struct Layout<'a, U: Copy + Clone = ()> {
     current_line_gap: f32,
     /// The ceil(new_line_size) of the current style.
     current_new_line: f32,
+    /// The line height multiplier of the current style.
+    current_line_height: Option<f32>,
     /// The x position the current line starts at.
     start_pos: f32,
     /// If the text is justified.
@@ -354,10 +390,10 @@ pub struct Layout<'a, U: Copy + Clone = ()> {
     settings: LayoutSettings,
 }
 
-impl<'a, U: Copy + Clone> Layout<'a, U> {
+impl<'f, U: Copy + Clone> Layout<'f, U> {
     /// Creates a layout instance. This requires the direction that the Y coordinate increases in.
     /// Layout needs to be aware of your coordinate system to place the glyphs correctly.
-    pub fn new(coordinate_system: CoordinateSystem) -> Layout<'a, U> {
+    pub fn new(font: &'f Font, px: f32, coordinate_system: CoordinateSystem) -> Layout<'f, U> {
         let settings = LayoutSettings::default();
 
         let mut layout = Layout {
@@ -367,9 +403,10 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
             wrap_mask: LINEBREAK_NONE,
             max_width: 0.0,
             max_height: 0.0,
+            base_font: font,
+            base_px: px,
             vertical_align: 0.0,
             horizontal_align: 0.0,
-            line_height: 1.0,
             output: Vec::new(),
             glyphs: Vec::new(),
             line_metrics: Vec::new(),
@@ -385,6 +422,7 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
             current_descent: 0.0,
             current_line_gap: 0.0,
             current_new_line: 0.0,
+            current_line_height: None,
             start_pos: 0.0,
             height: 0.0,
             justify: false,
@@ -393,6 +431,12 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
         };
         layout.reset(&settings);
         layout
+    }
+
+    /// Changes the default font and scale settings
+    pub fn set_base(&mut self, font: &'f Font, px: f32) {
+        self.base_font = font;
+        self.base_px = px;
     }
 
     /// Resets the current layout settings and clears all appended text.
@@ -425,7 +469,6 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
                 HorizontalAlign::Right => 1.0,
             }
         };
-        self.line_height = settings.line_height;
         self.justify = settings.horizontal_align == HorizontalAlign::Justify;
         self.wrap_by_letter = settings.wrap_style == WrapStyle::Letter;
         self.clear();
@@ -450,6 +493,7 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
         self.current_descent = 0.0;
         self.current_line_gap = 0.0;
         self.current_new_line = 0.0;
+        self.current_line_height = None;
         self.start_pos = 0.0;
         self.height = 0.0;
     }
@@ -464,7 +508,7 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
     }
 
     /// Gets the currently positioned lines. If there are no lines positioned, this returns none.
-    pub fn lines(&'a self) -> Option<&'a Vec<LinePosition>> {
+    pub fn lines(&self) -> Option<&Vec<LinePosition>> {
         if self.glyphs.is_empty() {
             None
         } else {
@@ -484,10 +528,10 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
     /// Custom inline blocks are also allowed, and are treated as single non whitespace glyphs
     /// with the specified width and height, and it is up to the application to decide what
     /// to do with this reserved space.
-    pub fn append(&mut self, span: &Span<'a, U>) {
-        match span.params {
-            SpanParams::Text(text) => self.append_text(span.px, span.font, span.user_data, text),
-            SpanParams::Block(p) => self.append_block(span.px, span.font, span.user_data, &p),
+    pub fn append<'t>(&mut self, span: Span<'f, 't, U>) {
+        match &span.params {
+            SpanParams::Text(p) => self.append_text(&span, p, span.user_data),
+            SpanParams::Block(p) => self.append_block(&span, p, span.user_data),
         }
     }
 
@@ -499,17 +543,21 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
     /// Characters from the input string can only be omitted from the output, they are never
     /// reordered. The output buffer will always contain characters in the order they were defined
     /// in the styles.
-    fn append_text(&mut self, px: f32, font: &'a Font, user_data: U, text: &'a str) {
+    fn append_text<'t>(&mut self, common_params: &Span<'f, 't, U>, text: &'t str, user_data: U) {
         // The first layout pass requires some text.
         if text.is_empty() {
             return;
         }
+
+        let font = common_params.font.unwrap_or(self.base_font);
+        let px = common_params.px.unwrap_or(self.base_px);
 
         if let Some(metrics) = font.horizontal_line_metrics(px) {
             self.current_ascent = ceil(metrics.ascent);
             self.current_new_line = ceil(metrics.new_line_size);
             self.current_descent = ceil(metrics.descent);
             self.current_line_gap = ceil(metrics.line_gap);
+            self.current_line_height = common_params.line_height;
             self.update_last_line_metrics();
         }
 
@@ -525,7 +573,7 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
             } else {
                 Metrics::default()
             };
-            let advance = ceil(metrics.advance_width);
+            let advance = ceil(metrics.advance_width + common_params.kerning);
 
             if linebreak >= self.linebreak_prev {
                 self.linebreak_prev = linebreak;
@@ -546,9 +594,10 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
             }
 
             let y = if self.flip {
-                floor(-metrics.bounds.height - metrics.bounds.ymin) // PositiveYDown
+                floor(-metrics.bounds.height - metrics.bounds.ymin - common_params.rise)
+            // PositiveYDown
             } else {
-                floor(metrics.bounds.ymin) // PositiveYUp
+                floor(metrics.bounds.ymin + common_params.rise) // PositiveYUp
             };
 
             self.glyphs.push(GlyphPosition {
@@ -574,17 +623,18 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
             line.padding = self.max_width - (self.current_pos - self.start_pos);
             line.glyph_end = self.glyphs.len().saturating_sub(1);
         }
-
-        self.finalize();
     }
 
     /// Performs layout for an inline block horizontally, and wrapping vertically. An inline
     /// block is treated as a single empty glyph with the specified width and height, and
     /// it is up to the application to decide what to do with this reserved space.
-    fn append_block(&mut self, px: f32, font: &'a Font, user_data: U, params: &BlockParams) {
+    fn append_block(&mut self, common_params: &Span<'f, '_, U>, params: &Block, user_data: U) {
         if params.width == 0 || params.height == 0 {
             return;
         }
+
+        let font = common_params.font.unwrap_or(self.base_font);
+        let px = common_params.px.unwrap_or(self.base_px);
 
         if let (Some(metrics), BlockAlign::Middle) = (font.horizontal_line_metrics(px), params.align) {
             let font_height = metrics.ascent - metrics.descent;
@@ -600,12 +650,13 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
             self.current_new_line = self.current_ascent;
             self.current_line_gap = 0.0;
         }
+        self.current_line_height = common_params.line_height;
         self.update_last_line_metrics();
 
         let character = 'x';
         let linebreak = self.linebreaker.next(character).mask(self.wrap_mask);
         let char_data = CharacterData::classify(character, 0);
-        let advance = params.width as f32;
+        let advance = params.width as f32 + common_params.kerning;
 
         if linebreak >= self.linebreak_prev {
             self.linebreak_prev = linebreak;
@@ -646,8 +697,6 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
             line.padding = self.max_width - (self.current_pos - self.start_pos);
             line.glyph_end = self.glyphs.len().saturating_sub(1);
         }
-
-        self.finalize();
     }
 
     fn update_last_line_metrics(&mut self) {
@@ -664,6 +713,9 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
             if self.current_new_line > line.max_new_line_size {
                 line.max_new_line_size = self.current_new_line;
             }
+            if let Some(line_height) = self.current_line_height {
+                line.line_height = Some(line.line_height.map(|h| h.max(line_height)).unwrap_or(line_height));
+            }
         }
     }
 
@@ -673,7 +725,7 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
         if let Some(line) = self.line_metrics.last_mut() {
             line.glyph_end = self.line_end_idx;
             line.padding = self.max_width - (self.line_end_pos - self.start_pos);
-            self.height += line.max_new_line_size * self.line_height;
+            self.height += line.max_new_line_size * line.line_height.unwrap_or(1.0);
             next_glyph_start = self.linebreak_idx + 1;
             if self.justify && !linebreak.is_hard() {
                 let n_spaces = self.glyphs[line.glyph_start..line.glyph_end]
@@ -698,6 +750,7 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
             min_descent: self.current_descent,
             max_line_gap: self.current_line_gap,
             max_new_line_size: self.current_new_line,
+            line_height: self.current_line_height,
             glyph_start: next_glyph_start,
             glyph_end: 0,
             tracking_x: self.linebreak_pos,
@@ -705,7 +758,7 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
         self.start_pos = self.linebreak_pos;
     }
 
-    fn finalize(&mut self) {
+    pub fn finalize(&mut self) {
         // The second layout pass requires at least 1 glyph to layout.
         if self.glyphs.is_empty() {
             return;
@@ -733,12 +786,12 @@ impl<'a, U: Copy + Clone> Layout<'a, U> {
                 self.output.push(glyph);
                 idx += 1;
             }
-            baseline_y -= dir * (line.max_new_line_size * self.line_height - line.max_ascent);
+            baseline_y -= dir * (line.max_new_line_size * line.line_height.unwrap_or(1.0) - line.max_ascent);
         }
     }
 
     /// Gets the currently laid out glyphs.
-    pub fn glyphs(&'a self) -> &'a Vec<GlyphPosition<U>> {
+    pub fn glyphs(&self) -> &Vec<GlyphPosition<U>> {
         &self.output
     }
 

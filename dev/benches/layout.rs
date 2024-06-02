@@ -13,7 +13,7 @@ fn fontdue_layout_benchmark(c: &mut Criterion) {
     // Loading
     let font = include_bytes!("../resources/fonts/Roboto-Regular.ttf") as &[u8];
     let roboto_regular = fontdue::Font::from_bytes(font, fontdue::FontSettings::default()).unwrap();
-    let mut layout = Layout::new(CoordinateSystem::PositiveYUp);
+    let mut layout = Layout::new(&roboto_regular, 20.0, CoordinateSystem::PositiveYUp);
     layout.reset(&LayoutSettings {
         max_width: Some(200.0),
         ..LayoutSettings::default()
@@ -23,11 +23,11 @@ fn fontdue_layout_benchmark(c: &mut Criterion) {
     group.measurement_time(core::time::Duration::from_secs(4));
     group.sample_size(250);
     for message in MESSAGES.iter() {
-        let span = &Span::text(message, 20.0, &roboto_regular);
         group.bench_with_input(BenchmarkId::from_parameter(message.len()), &message, |b, _| {
             b.iter(|| {
                 layout.clear();
-                layout.append(span);
+                layout.append(Span::text(message, ()));
+                layout.finalize();
                 layout.glyphs().len()
             });
         });
