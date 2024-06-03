@@ -337,9 +337,9 @@ pub struct Layout<'f, U: Copy + Clone = ()> {
     /// The current height of all laid out text.
     height: f32,
     /// The default font for the text.
-    base_font: &'f Font,
+    pub base_font: &'f Font,
     /// The default size for the text.
-    base_px: f32,
+    pub base_px: f32,
 
     /// Finalized glyph state.
     output: Vec<GlyphPosition<'f, U>>,
@@ -385,7 +385,7 @@ pub struct Layout<'f, U: Copy + Clone = ()> {
     wrap_by_letter: bool,
 
     /// The settings currently being used for layout.
-    settings: LayoutSettings,
+    pub settings: LayoutSettings,
 }
 
 impl<'f, U: Copy + Clone> Layout<'f, U> {
