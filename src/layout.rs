@@ -167,20 +167,20 @@ pub enum BlockAlign {
 }
 
 macro_rules! att_set {
-    ($method:ident $att:ident $t:ty) => {
+    ($method:ident, $($q:ident)+, $att:ident, $t:ty) => {
         #[must_use]
         pub fn $method(mut self, $att: $t) -> Self {
-            self.$att = $att;
+            self.$($q).* = $att;
             self
         }
     };
 }
 
 macro_rules! att_opt_set {
-    ($method:ident $att:ident $t:ty) => {
+    ($method:ident, $($q:ident)+, $att:ident, $t:ty) => {
         #[must_use]
         pub fn $method(mut self, $att: $t) -> Self {
-            self.$att = Some($att);
+            self.$($q).* = Some($att);
             self
         }
     };
@@ -206,19 +206,12 @@ impl Block {
         }
     }
 
-    att_set!(with_align align BlockAlign);
+    att_set!(with_align, align, align, BlockAlign);
 }
 
-/// Parameters specific to text or block.
-#[derive(Debug, Clone)]
-enum SpanParams<'t> {
-    Text(&'t str),
-    Block(Block),
-}
-
-/// Parameters to define a text span or inline block in a text layout.
-#[derive(Debug, Clone)]
-pub struct Span<'f, 't, U: Copy + Clone = ()> {
+/// Parameters common to both span variants.
+#[derive(Debug, Clone, Default)]
+struct CommonParams<'f> {
     /// The font to layout the text in.
     font: Option<&'f Font>,
     /// The scale of the text in pixel units. The units of the scale are pixels per Em unit.
@@ -229,8 +222,21 @@ pub struct Span<'f, 't, U: Copy + Clone = ()> {
     kerning: f32,
     /// Line height multiplier.
     line_height: Option<f32>,
+}
+
+/// Parameters specific to text or block.
+#[derive(Debug, Clone)]
+enum SpecificParams<'t> {
+    Text(&'t str),
+    Block(Block),
+}
+
+/// Parameters to define a text span or inline block in a text layout.
+#[derive(Debug, Clone)]
+pub struct Span<'f, 't, U: Copy + Clone = ()> {
+    common: CommonParams<'f>,
     /// Parameters specific to text or block.
-    params: SpanParams<'t>,
+    params: SpecificParams<'t>,
     /// Additional user data to associate with glyphs produced by this span.
     user_data: U,
 }
@@ -238,33 +244,25 @@ pub struct Span<'f, 't, U: Copy + Clone = ()> {
 impl<'f, 't, U: Copy + Clone> Span<'f, 't, U> {
     pub fn text(text: &'t str, user_data: U) -> Self {
         Span {
-            font: None,
-            px: None,
-            rise: 0.0,
-            kerning: 0.0,
-            line_height: None,
-            params: SpanParams::Text(text),
+            common: CommonParams::default(),
+            params: SpecificParams::Text(text),
             user_data,
         }
     }
 
     pub fn block(block: Block, user_data: U) -> Self {
         Span {
-            font: None,
-            px: None,
-            rise: 0.0,
-            kerning: 0.0,
-            line_height: None,
-            params: SpanParams::Block(block),
+            common: CommonParams::default(),
+            params: SpecificParams::Block(block),
             user_data,
         }
     }
 
-    att_opt_set!(with_font font &'f Font);
-    att_opt_set!(with_px px f32);
-    att_set!(with_rise rise f32);
-    att_set!(with_kerning kerning f32);
-    att_opt_set!(with_line_height line_height f32);
+    att_opt_set!(with_font, common font, font, &'f Font);
+    att_opt_set!(with_px, common px, px, f32);
+    att_set!(with_rise, common rise, rise, f32);
+    att_set!(with_kerning, common kerning, kerning, f32);
+    att_opt_set!(with_line_height, common line_height, line_height, f32);
 }
 
 /// Metrics about a positioned line.
@@ -529,9 +527,9 @@ impl<'f, U: Copy + Clone> Layout<'f, U> {
     /// with the specified width and height, and it is up to the application to decide what
     /// to do with this reserved space.
     pub fn append<'t>(&mut self, span: Span<'f, 't, U>) {
-        match &span.params {
-            SpanParams::Text(p) => self.append_text(&span, p, span.user_data),
-            SpanParams::Block(p) => self.append_block(&span, p, span.user_data),
+        match span.params {
+            SpecificParams::Text(p) => self.append_text(span.common, p, span.user_data),
+            SpecificParams::Block(p) => self.append_block(span.common, p, span.user_data),
         }
     }
 
@@ -543,21 +541,21 @@ impl<'f, U: Copy + Clone> Layout<'f, U> {
     /// Characters from the input string can only be omitted from the output, they are never
     /// reordered. The output buffer will always contain characters in the order they were defined
     /// in the styles.
-    fn append_text<'t>(&mut self, common_params: &Span<'f, 't, U>, text: &'t str, user_data: U) {
+    fn append_text<'t>(&mut self, params: CommonParams<'f>, text: &'t str, user_data: U) {
         // The first layout pass requires some text.
         if text.is_empty() {
             return;
         }
 
-        let font = common_params.font.unwrap_or(self.base_font);
-        let px = common_params.px.unwrap_or(self.base_px);
+        let font = params.font.unwrap_or(self.base_font);
+        let px = params.px.unwrap_or(self.base_px);
 
         if let Some(metrics) = font.horizontal_line_metrics(px) {
             self.current_ascent = ceil(metrics.ascent);
             self.current_new_line = ceil(metrics.new_line_size);
             self.current_descent = ceil(metrics.descent);
             self.current_line_gap = ceil(metrics.line_gap);
-            self.current_line_height = common_params.line_height;
+            self.current_line_height = params.line_height;
             self.update_last_line_metrics();
         }
 
@@ -573,7 +571,7 @@ impl<'f, U: Copy + Clone> Layout<'f, U> {
             } else {
                 Metrics::default()
             };
-            let advance = ceil(metrics.advance_width + common_params.kerning);
+            let advance = ceil(metrics.advance_width + params.kerning);
 
             if linebreak >= self.linebreak_prev {
                 self.linebreak_prev = linebreak;
@@ -594,10 +592,10 @@ impl<'f, U: Copy + Clone> Layout<'f, U> {
             }
 
             let y = if self.flip {
-                floor(-metrics.bounds.height - metrics.bounds.ymin - common_params.rise)
+                floor(-metrics.bounds.height - metrics.bounds.ymin - params.rise)
             // PositiveYDown
             } else {
-                floor(metrics.bounds.ymin + common_params.rise) // PositiveYUp
+                floor(metrics.bounds.ymin + params.rise) // PositiveYUp
             };
 
             self.glyphs.push(GlyphPosition {
@@ -628,35 +626,35 @@ impl<'f, U: Copy + Clone> Layout<'f, U> {
     /// Performs layout for an inline block horizontally, and wrapping vertically. An inline
     /// block is treated as a single empty glyph with the specified width and height, and
     /// it is up to the application to decide what to do with this reserved space.
-    fn append_block(&mut self, common_params: &Span<'f, '_, U>, params: &Block, user_data: U) {
-        if params.width == 0 || params.height == 0 {
+    fn append_block(&mut self, params: CommonParams<'f>, block: Block, user_data: U) {
+        if block.width == 0 || block.height == 0 {
             return;
         }
 
-        let font = common_params.font.unwrap_or(self.base_font);
-        let px = common_params.px.unwrap_or(self.base_px);
+        let font = params.font.unwrap_or(self.base_font);
+        let px = params.px.unwrap_or(self.base_px);
 
-        if let (Some(metrics), BlockAlign::Middle) = (font.horizontal_line_metrics(px), params.align) {
+        if let (Some(metrics), BlockAlign::Middle) = (font.horizontal_line_metrics(px), block.align) {
             let font_height = metrics.ascent - metrics.descent;
-            let block_ascent = metrics.ascent / font_height * params.height as f32;
-            let block_descent = metrics.descent / font_height * params.height as f32;
+            let block_ascent = metrics.ascent / font_height * block.height as f32;
+            let block_descent = metrics.descent / font_height * block.height as f32;
             self.current_ascent = ceil(block_ascent);
             self.current_descent = ceil(block_descent);
             self.current_new_line = ceil(block_ascent - block_descent + metrics.line_gap);
             self.current_line_gap = ceil(metrics.line_gap);
         } else {
-            self.current_ascent = params.height as f32;
+            self.current_ascent = block.height as f32;
             self.current_descent = 0.0;
             self.current_new_line = self.current_ascent;
             self.current_line_gap = 0.0;
         }
-        self.current_line_height = common_params.line_height;
+        self.current_line_height = params.line_height;
         self.update_last_line_metrics();
 
         let character = 'x';
         let linebreak = self.linebreaker.next(character).mask(self.wrap_mask);
         let char_data = CharacterData::classify(character, 0);
-        let advance = params.width as f32 + common_params.kerning;
+        let advance = block.width as f32 + params.kerning;
 
         if linebreak >= self.linebreak_prev {
             self.linebreak_prev = linebreak;
@@ -685,8 +683,8 @@ impl<'f, U: Copy + Clone> Layout<'f, U> {
             parent: character,
             x: floor(self.current_pos),
             y,
-            width: params.width,
-            height: params.height,
+            width: block.width,
+            height: block.height,
             char_data,
             user_data,
         });
